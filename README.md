@@ -138,6 +138,7 @@ Commands are given after arguments, they can be chained and some have shortcuts.
     login &lt;name&gt; &lt;pwd&gt;     : log into a node (rep) with given pwd   l
     logout &lt;name&gt;          : log out of a repeater
     cmd &lt;name&gt; &lt;cmd&gt;       : sends a command to a repeater (no ack) c  [
+    ota &lt;name&gt; &lt;bin&gt; [sz]  : RP2040 OTA update over mesh (chunk sz)
     wmt8                   : wait for a msg (reply) with a timeout     ]
     req_status &lt;name&gt;      : requests status from a node            rs
     req_neighbours &lt;name&gt;  : requests for neighbours in binary form rn

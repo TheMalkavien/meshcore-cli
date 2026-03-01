@@ -7,7 +7,9 @@ import asyncio
 import os, sys, io, platform
 import time, datetime
 import getopt, json, shlex, re
+import hashlib
 import logging
+from collections import deque
 import requests
 import serial.tools.list_ports
 from pathlib import Path
@@ -56,6 +58,109 @@ JSON = False
 
 PS = None
 CS = None
+REPEATER_REPLY_BUFFER = deque(maxlen=256)
+MAX_MESH_CMD_TEXT_LEN = 160
+REPEATER_CMD_TOKEN_LEN = 5  # "<seq>|", for example "00af|"
+OTA_WRITE_CMD_PREFIX = "ota write "
+OTA_OFFSET_ERR_RE = re.compile(r"(?:[0-9a-fA-F]+\|)?Err - offset (\d+) expected (\d+)")
+OTA_NOACK_WRITE_GAP_SEC = 0.05
+OTA_ACK_SETTLE_GAP_SEC = 0.03
+# Max wait for a checkpoint ACK before continuing optimistically.
+OTA_CHECKPOINT_ACK_TIMEOUT_SEC = 0.5
+
+
+def split_cli_args(line):
+    # On Windows, POSIX shlex treats backslashes as escapes and mangles paths.
+    if os.name == "nt":
+        parts = shlex.split(line, posix=False)
+        cleaned = []
+        for p in parts:
+            if len(p) >= 2 and p[0] == p[-1] and p[0] in ("\"", "'"):
+                cleaned.append(p[1:-1])
+            else:
+                cleaned.append(p)
+        return cleaned
+    return shlex.split(line)
+
+
+def queue_repeater_reply(payload):
+    if payload is None:
+        return
+    if payload.get("txt_type") != 1:
+        return
+    text = payload.get("text")
+    if not isinstance(text, str):
+        return
+    REPEATER_REPLY_BUFFER.append(payload.copy())
+
+
+def pop_repeater_reply(prefix, expected_prefix=None):
+    for i, payload in enumerate(REPEATER_REPLY_BUFFER):
+        if payload.get("txt_type") != 1:
+            continue
+        if payload.get("pubkey_prefix", "").lower() != prefix:
+            continue
+        text = payload.get("text", "")
+        if expected_prefix is not None:
+            if not text.startswith(expected_prefix):
+                continue
+            text = text[len(expected_prefix):]
+        del REPEATER_REPLY_BUFFER[i]
+        return text
+    return None
+
+
+def pop_latest_ota_offset_error(prefix):
+    latest = None
+    kept = deque(maxlen=REPEATER_REPLY_BUFFER.maxlen)
+
+    for payload in REPEATER_REPLY_BUFFER:
+        if payload.get("txt_type") != 1:
+            kept.append(payload)
+            continue
+        if payload.get("pubkey_prefix", "").lower() != prefix:
+            kept.append(payload)
+            continue
+
+        text = payload.get("text", "")
+        m = OTA_OFFSET_ERR_RE.search(text)
+        if not m:
+            kept.append(payload)
+            continue
+
+        try:
+            got = int(m.group(1))
+            expected = int(m.group(2))
+        except ValueError:
+            kept.append(payload)
+            continue
+
+        if latest is None or expected >= latest[1]:
+            latest = (got, expected, text)
+
+    REPEATER_REPLY_BUFFER.clear()
+    REPEATER_REPLY_BUFFER.extend(kept)
+    return latest
+
+
+def purge_repeater_replies(prefix, expected_prefix=None):
+    kept = deque(maxlen=REPEATER_REPLY_BUFFER.maxlen)
+    removed = 0
+    for payload in REPEATER_REPLY_BUFFER:
+        if payload.get("txt_type") != 1:
+            kept.append(payload)
+            continue
+        if payload.get("pubkey_prefix", "").lower() != prefix:
+            kept.append(payload)
+            continue
+        text = payload.get("text", "")
+        if expected_prefix is not None and not text.startswith(expected_prefix):
+            kept.append(payload)
+            continue
+        removed += 1
+    REPEATER_REPLY_BUFFER.clear()
+    REPEATER_REPLY_BUFFER.extend(kept)
+    return removed
 
 # Ansi colors
 ANSI_END = "\033[0m"
@@ -137,6 +242,11 @@ async def process_event_message(mc, ev, json_output, end="\n", above=False):
     else :
         await mc.ensure_contacts()
         data = ev.payload
+        if data.get("txt_type") == 1:
+            txt = data.get("text")
+            if isinstance(txt, str) and re.fullmatch(r"[0-9a-fA-F]+\|", txt.strip()):
+                # Token-only repeater reply: internal flow-control signal, hide from user output.
+                return True
 
         path_str = ""
 
@@ -475,6 +585,7 @@ log_message.file=None
 
 async def handle_message(event):
     """ Process incoming message events """
+    queue_repeater_reply(event.payload)
     if handle_message.display :
         await process_event_message(handle_message.mc, event,
                                 above=handle_message.above,
@@ -595,6 +706,7 @@ def make_completion_dict(contacts, pending={}, to=None, channels=None):
         "reload_contacts" : None,
         "login" : contact_list,
         "cmd" : contact_list,
+        "ota" : contact_list,
         "req_status" : contact_list,
         "req_neighbours": contact_list,
         "logout" : contact_list,
@@ -618,7 +730,7 @@ def make_completion_dict(contacts, pending={}, to=None, channels=None):
             "pin" : None,
             "radio" : {",,,":None, "f,bw,sf,cr":None},
             "tx" : None,
-            "tuning" : {",", "af,tx_d"},
+            "tuning" : {"rx_dly,af": None},
             "lat" : None,
             "lon" : None,
             "coords" : None,
@@ -693,6 +805,7 @@ def make_completion_dict(contacts, pending={}, to=None, channels=None):
         "?set":None,
         "?scope":None,
         "?contact_info":None,
+        "?ota":None,
         "?apply_to":None,
         "?at":None,
         "?node_discover":None,
@@ -742,6 +855,7 @@ def make_completion_dict(contacts, pending={}, to=None, channels=None):
         "req_status" : None,
         "req_neighbours": None,
         "cmd" : None,
+        "ota" : None,
         "ver" : None,
         "advert" : None,
         "time" : None,
@@ -1027,7 +1141,7 @@ Some cmds have an help accessible with ?<cmd>. Do ?[Tab] to get a list.
             # raw meshcli command as on command line
             elif line.startswith("$") :
                 try :
-                    args = shlex.split(line[1:])
+                    args = split_cli_args(line[1:])
                     await process_cmds(mc, args)
                 except ValueError:
                     logger.error("Error parsing line {line[1:]}")
@@ -1127,7 +1241,7 @@ Some cmds have an help accessible with ?<cmd>. Do ?[Tab] to get a list.
                             await send_chan_msg(mc, ch["channel_idx"], line.split(" ", 1)[1])
                         else :
                             try :
-                                await process_cmds(mc, shlex.split(line[1:]))
+                                await process_cmds(mc, split_cli_args(line[1:]))
                             except ValueError:
                                 logger.error(f"Error processing line{line[1:]}")
                 else:
@@ -1170,7 +1284,7 @@ Some cmds have an help accessible with ?<cmd>. Do ?[Tab] to get a list.
             # commands are passed through if at root
             elif contact is None or line.startswith(".") :
                 try:
-                    args = shlex.split(line)
+                    args = split_cli_args(line)
                     await process_cmds(mc, args)
                 except ValueError:
                     logger.error(f"Error processing {line}")
@@ -1371,7 +1485,7 @@ async def process_contact_chat_line(mc, contact, line):
     if contact["type"] > 1 and\
         (line.startswith("setperm ") or line.startswith("set perm ")):
         try:
-            cmds = shlex.split(line)
+            cmds = split_cli_args(line)
             off = 1 if line.startswith("set perm") else 0
             name = cmds[1 + off]
             perm_string = cmds[2 + off]
@@ -1402,6 +1516,16 @@ async def process_contact_chat_line(mc, contact, line):
 
     if line == "dtrace" or line == "dt" :
         await print_disc_trace_to(mc, contact)
+        return True
+
+    if contact["type"] > 1 and line.startswith("ota "):
+        try:
+            parts = split_cli_args(line)
+        except ValueError:
+            print("Bad ota syntax")
+            return True
+        args = ["ota", contact["adv_name"]] + parts[1:]
+        await process_cmds(mc, args)
         return True
 
     # same but for commands with a parameter
@@ -1592,6 +1716,549 @@ async def send_cmd (mc, contact, cmd) :
             sent["name"] = sent["recipient"]
             await log_message(mc, sent)
     return res
+
+def parse_ota_status(reply_text):
+    if reply_text is None:
+        return None
+    m = re.search(r"(\d+)\s*/\s*(\d+)", reply_text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2))
+    except ValueError:
+        return None
+
+
+def parse_ota_offset_error(reply_text):
+    if reply_text is None:
+        return None
+    m = OTA_OFFSET_ERR_RE.search(reply_text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2))
+    except ValueError:
+        return None
+
+
+async def wait_repeater_reply(mc, contact, timeout, expected_prefix=None):
+    prefix = contact["public_key"][:12].lower()
+    end_t = time.time() + timeout
+
+    while time.time() < end_t:
+        queued = pop_repeater_reply(prefix, expected_prefix=expected_prefix)
+        if queued is not None:
+            return queued
+
+        # Drain currently queued messages first (if any), then wait for new message notifications.
+        while True:
+            msg_evt = await mc.commands.get_msg()
+            if msg_evt is None or msg_evt.type in [EventType.NO_MORE_MSGS, EventType.ERROR]:
+                break
+            if msg_evt.type != EventType.CONTACT_MSG_RECV:
+                continue
+            payload = msg_evt.payload
+            if payload.get("txt_type") != 1:
+                continue
+            if payload.get("pubkey_prefix", "").lower() != prefix:
+                queue_repeater_reply(payload)
+                continue
+            text = payload.get("text", "")
+            if expected_prefix is not None:
+                if not text.startswith(expected_prefix):
+                    queue_repeater_reply(payload)
+                    continue
+                text = text[len(expected_prefix):]
+            return text
+
+        remaining = end_t - time.time()
+        if remaining <= 0:
+            break
+        await mc.wait_for_event(EventType.MESSAGES_WAITING, timeout=min(remaining, 0.1))
+
+    return None
+
+async def send_repeater_cmd_and_wait_reply(mc, contact, cmd, timeout=0):
+    seq = send_repeater_cmd_and_wait_reply.seq
+    send_repeater_cmd_and_wait_reply.seq = (seq + 1) & 0xFFFF
+    token = f"{seq:04x}|"
+    prefix = contact["public_key"][:12].lower()
+
+    # Avoid token collisions with delayed/queued replies.
+    purge_repeater_replies(prefix, expected_prefix=token)
+
+    res = await send_cmd(mc, contact, token + cmd)
+    if res is None or res.type == EventType.ERROR:
+        return None, f"send error: {res}"
+
+    suggested = res.payload.get("suggested_timeout", 8000) / 800.0
+    reply_timeout = timeout if timeout and timeout > 0 else max(8.0, suggested * 1.5)
+    reply = await wait_repeater_reply(mc, contact, reply_timeout, expected_prefix=token)
+
+    if reply is None:
+        return None, f"timeout waiting reply to '{cmd}'"
+    return reply, None
+send_repeater_cmd_and_wait_reply.seq = int(time.time() * 1000) & 0xFFFF
+
+
+async def send_repeater_cmd_no_wait(mc, contact, cmd):
+    seq = send_repeater_cmd_and_wait_reply.seq
+    send_repeater_cmd_and_wait_reply.seq = (seq + 1) & 0xFFFF
+    token = f"{seq:04x}|"
+    res = await send_cmd(mc, contact, token + cmd)
+    if res is None or res.type == EventType.ERROR:
+        return f"send error: {res}"
+    return None
+
+
+def max_ota_chunk_for_offset(offset):
+    fixed_len = REPEATER_CMD_TOKEN_LEN + len(OTA_WRITE_CMD_PREFIX) + len(str(offset)) + 1
+    available_hex = MAX_MESH_CMD_TEXT_LEN - fixed_len
+    if available_hex < 2:
+        return 0
+    return available_hex // 2
+
+
+def estimate_ota_chunk_count(total_size, preferred_chunk):
+    if total_size <= 0:
+        return 0
+    offset = 0
+    count = 0
+    while offset < total_size:
+        max_chunk = max_ota_chunk_for_offset(offset)
+        if max_chunk < 1:
+            return 0
+        step = min(preferred_chunk, max_chunk, total_size - offset)
+        offset += step
+        count += 1
+    return count
+
+
+def estimate_ota_chunk_index(offset, preferred_chunk):
+    if offset <= 0:
+        return 0
+    sent = 0
+    count = 0
+    while sent < offset:
+        max_chunk = max_ota_chunk_for_offset(sent)
+        if max_chunk < 1:
+            break
+        step = min(preferred_chunk, max_chunk, offset - sent)
+        sent += step
+        count += 1
+    return count
+
+
+async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_every=1, json_output=False):
+    if chunk_size < 16 or chunk_size > 80:
+        if json_output:
+            print(json.dumps({"error": "chunk_size must be between 16 and 80"}))
+        else:
+            print("chunk_size must be between 16 and 80")
+        return False
+    if ack_every < 1 or ack_every > 64:
+        if json_output:
+            print(json.dumps({"error": "ack_every must be between 1 and 64"}))
+        else:
+            print("ack_every must be between 1 and 64")
+        return False
+
+    firmware_path = firmware_path.strip()
+    if len(firmware_path) >= 2 and firmware_path[0] == firmware_path[-1] and firmware_path[0] in ("\"", "'"):
+        firmware_path = firmware_path[1:-1]
+    normalized_path = os.path.normpath(os.path.expanduser(firmware_path))
+
+    try:
+        with open(normalized_path, "rb") as f:
+            firmware = f.read()
+    except OSError as e:
+        if json_output:
+            print(json.dumps({"error": f"unable to read firmware file: {e}"}))
+        else:
+            print(f"Unable to read firmware file: {e}")
+        return False
+
+    if len(firmware) == 0:
+        if json_output:
+            print(json.dumps({"error": "firmware file is empty"}))
+        else:
+            print("Firmware file is empty")
+        return False
+
+    fw_size = len(firmware)
+    fw_md5 = hashlib.md5(firmware).hexdigest()
+    max_offset = max(0, fw_size - 1)
+    safe_chunk_limit = max_ota_chunk_for_offset(max_offset)
+    if safe_chunk_limit < 16:
+        msg = f"transport limit too low for OTA writes (safe chunk={safe_chunk_limit})"
+        if json_output:
+            print(json.dumps({"error": msg}))
+        else:
+            print(f"OTA aborted: {msg}")
+        return False
+    if chunk_size > safe_chunk_limit:
+        if not json_output:
+            print(
+                f"Requested chunk_size {chunk_size} is too large for command transport; "
+                f"using {safe_chunk_limit}."
+            )
+        chunk_size = safe_chunk_limit
+
+    total_chunks = estimate_ota_chunk_count(fw_size, chunk_size)
+    if total_chunks <= 0:
+        msg = "unable to compute OTA chunk plan"
+        if json_output:
+            print(json.dumps({"error": msg}))
+        else:
+            print(f"OTA aborted: {msg}")
+        return False
+
+    if not json_output:
+        print(f"OTA target: {contact['adv_name']}")
+        print(f"Firmware: {normalized_path} ({fw_size} bytes, md5={fw_md5})")
+        print(f"Chunk size: {chunk_size} bytes ({total_chunks} chunks)")
+        print(f"Ack every: {ack_every} chunk(s)")
+
+    async def get_ota_status(max_attempts=2):
+        last_err = None
+        for attempt in range(max_attempts):
+            status_reply, status_err = await send_repeater_cmd_and_wait_reply(mc, contact, "ota status", timeout=10)
+            if status_err is None:
+                return status_reply, parse_ota_status(status_reply), None
+            last_err = status_err
+            if attempt + 1 < max_attempts:
+                await asyncio.sleep(0.2 * (attempt + 1))
+        return None, None, last_err
+
+    max_write_retries = 3
+
+    last_print_pct = -1
+    offset = 0
+    chunk_idx = 0
+    chunks_since_ack = 0
+    contact_prefix = contact["public_key"][:12].lower()
+    purge_repeater_replies(contact_prefix)
+
+    reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, "start ota", timeout=15)
+    if err:
+        if json_output:
+            print(json.dumps({"error": err, "phase": "start"}))
+        else:
+            print(f"Start OTA failed: {err}")
+        return False
+    if not reply.lower().startswith("ok"):
+        # If an OTA session is already active, try to resume it.
+        if "already running" in reply.lower():
+            status_reply, status, status_err = await get_ota_status(max_attempts=3)
+            if status_err is not None:
+                if json_output:
+                    print(json.dumps({"error": f"{reply}; {status_err}", "phase": "start"}))
+                else:
+                    print(f"Start OTA failed: {reply}; {status_err}")
+                return False
+            if status and status[1] == fw_size and status[0] <= fw_size:
+                offset = status[0]
+                chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
+                if not json_output:
+                    print(f"Resuming OTA session at offset {offset}/{fw_size}")
+            else:
+                msg = f"{reply}; status={status_reply}"
+                if json_output:
+                    print(json.dumps({"error": msg, "phase": "start"}))
+                else:
+                    print(f"Start OTA failed: {msg}")
+                return False
+        else:
+            if json_output:
+                print(json.dumps({"error": reply, "phase": "start"}))
+            else:
+                print(f"Start OTA failed: {reply}")
+            return False
+
+    if offset == 0:
+        begin_cmd = f"ota begin {fw_size} {fw_md5} {ack_every}"
+        reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, begin_cmd, timeout=20)
+        if (err is None and not reply.lower().startswith("ok") and ack_every > 1 and
+                ("too many args" in reply.lower() or "bad ack" in reply.lower())):
+            # Backward compatibility for repeaters that don't support begin ack_every.
+            if not json_output:
+                print("Repeater does not support begin ack_every, fallback to ack_every=1.")
+            ack_every = 1
+            chunks_since_ack = 0
+            begin_cmd = f"ota begin {fw_size} {fw_md5}"
+            reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, begin_cmd, timeout=20)
+        if err:
+            if json_output:
+                print(json.dumps({"error": err, "phase": "begin"}))
+            else:
+                print(f"OTA begin failed: {err}")
+            return False
+        if not reply.lower().startswith("ok"):
+            if json_output:
+                print(json.dumps({"error": reply, "phase": "begin"}))
+            else:
+                print(f"OTA begin failed: {reply}")
+            return False
+
+    while offset < fw_size:
+        pending_offset_error = pop_latest_ota_offset_error(contact_prefix)
+        if pending_offset_error is not None:
+            _, expected_offset, _ = pending_offset_error
+            if 0 <= expected_offset <= fw_size and expected_offset != offset:
+                status_reply, status, _ = await get_ota_status(max_attempts=1)
+                if status and status[1] == fw_size and status[0] <= fw_size:
+                    expected_offset = status[0]
+                if expected_offset != offset:
+                    offset = expected_offset
+                    chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
+                    chunks_since_ack = 0
+                    if not json_output:
+                        if status_reply:
+                            print(f"Resync offset to {offset}/{fw_size} ({status_reply})")
+                        else:
+                            print(f"Resync offset to {offset}/{fw_size}")
+                    continue
+
+        max_chunk = max_ota_chunk_for_offset(offset)
+        if max_chunk < 1:
+            if json_output:
+                print(json.dumps({"error": "no room left for ota write command", "phase": "write", "offset": offset}))
+            else:
+                print(f"OTA write failed at offset {offset}: no room left for ota write command")
+            return False
+
+        chunk_len = min(chunk_size, max_chunk, fw_size - offset)
+        chunk = firmware[offset : offset + chunk_len]
+        chunk_cmd = f"ota write {offset} {chunk.hex()}"
+        is_last_chunk = (offset + len(chunk) >= fw_size)
+        checkpoint_due = (chunks_since_ack + 1 >= ack_every) or is_last_chunk
+        checkpoint_wait_mode = (ack_every > 1) and checkpoint_due
+        wait_for_ack = (ack_every <= 1) and checkpoint_due
+
+        if checkpoint_wait_mode:
+            chunk_sent = False
+            failure = None
+
+            for attempt in range(1, max_write_retries + 1):
+                reply, err = await send_repeater_cmd_and_wait_reply(
+                    mc, contact, chunk_cmd, timeout=OTA_CHECKPOINT_ACK_TIMEOUT_SEC
+                )
+
+                if err is None and (reply == "" or reply.lower().startswith("ok")):
+                    offset += len(chunk)
+                    chunk_idx += 1
+                    chunks_since_ack = 0
+                    chunk_sent = True
+                    break
+                if err is not None and err.startswith("timeout waiting reply"):
+                    # For checkpoint writes we can continue optimistically on missing ack;
+                    # any real desync will be caught quickly by following offset-checked writes.
+                    offset += len(chunk)
+                    chunk_idx += 1
+                    chunks_since_ack = 0
+                    chunk_sent = True
+                    break
+
+                offset_err = parse_ota_offset_error(reply) if err is None else None
+                if offset_err is not None:
+                    _, expected_offset = offset_err
+                    if expected_offset >= offset + len(chunk):
+                        # Checkpoint write likely succeeded, but we got a duplicate/late retry response.
+                        offset = expected_offset
+                        chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
+                        chunks_since_ack = 0
+                        chunk_sent = True
+                        break
+                    if expected_offset < offset:
+                        # Local offset got ahead; restart from repeater confirmed offset.
+                        offset = expected_offset
+                        chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
+                        chunks_since_ack = 0
+                        chunk_sent = True
+                        if not json_output:
+                            print(f"Resync offset to {offset}/{fw_size}")
+                        break
+
+                if err:
+                    failure = err
+                elif reply:
+                    failure = reply
+                else:
+                    failure = "checkpoint ack missing"
+
+                if attempt < max_write_retries:
+                    if not json_output:
+                        print(f"Retry checkpoint at offset {offset} ({attempt}/{max_write_retries})")
+                    await asyncio.sleep(0.12 * attempt)
+                    continue
+
+                status_reply, status, status_err = await get_ota_status(max_attempts=2)
+                if status and status[1] == fw_size and status[0] <= fw_size:
+                    if status[0] >= offset + len(chunk):
+                        # Checkpoint write likely succeeded, but ack reply was lost.
+                        offset = status[0]
+                        chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
+                        chunks_since_ack = 0
+                        chunk_sent = True
+                        break
+                    if status[0] < offset:
+                        # Local offset got ahead; restart from repeater confirmed offset.
+                        offset = status[0]
+                        chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
+                        chunks_since_ack = 0
+                        chunk_sent = True
+                        if not json_output:
+                            print(f"Resync offset to {offset}/{fw_size}")
+                        break
+                if status_err is None and status_reply is not None:
+                    failure = f"{failure}; status={status_reply}"
+
+            if not chunk_sent:
+                if json_output:
+                    print(json.dumps({"error": failure, "phase": "write", "offset": offset}))
+                else:
+                    print(f"OTA write failed at offset {offset}: {failure}")
+                return False
+            if OTA_ACK_SETTLE_GAP_SEC > 0:
+                await asyncio.sleep(OTA_ACK_SETTLE_GAP_SEC)
+        elif not wait_for_ack:
+            send_err = await send_repeater_cmd_no_wait(mc, contact, chunk_cmd)
+            if send_err:
+                status_reply, status, status_err = await get_ota_status(max_attempts=2)
+                if status and status[0] != offset:
+                    offset = status[0]
+                    chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
+                    chunks_since_ack = 0
+                    if not json_output:
+                        print(f"Resync offset to {offset}/{fw_size}")
+                    continue
+                failure = send_err
+                if status_err is None and status_reply is not None:
+                    failure = f"{failure}; status={status_reply}"
+                if json_output:
+                    print(json.dumps({"error": failure, "phase": "write", "offset": offset}))
+                else:
+                    print(f"OTA write failed at offset {offset}: {failure}")
+                return False
+
+            offset += len(chunk)
+            chunk_idx += 1
+            chunks_since_ack += 1
+
+            pending_offset_error = pop_latest_ota_offset_error(contact_prefix)
+            if pending_offset_error is not None:
+                _, expected_offset, _ = pending_offset_error
+                if 0 <= expected_offset <= fw_size and expected_offset != offset:
+                    status_reply, status, _ = await get_ota_status(max_attempts=1)
+                    if status and status[1] == fw_size and status[0] <= fw_size:
+                        expected_offset = status[0]
+                    if expected_offset != offset:
+                        offset = expected_offset
+                        chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
+                        chunks_since_ack = 0
+                        if not json_output:
+                            if status_reply:
+                                print(f"Resync offset to {offset}/{fw_size} ({status_reply})")
+                            else:
+                                print(f"Resync offset to {offset}/{fw_size}")
+                        continue
+            elif OTA_NOACK_WRITE_GAP_SEC > 0:
+                await asyncio.sleep(OTA_NOACK_WRITE_GAP_SEC)
+        else:
+            chunk_sent = False
+            failure = None
+
+            for attempt in range(1, max_write_retries + 1):
+                reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, chunk_cmd, timeout=5)
+
+                if err is None:
+                    if reply == "" or reply.lower().startswith("ok"):
+                        offset += len(chunk)
+                        chunk_idx += 1
+                        # Keep local checkpoint cadence stable even if repeater suppressed explicit OK.
+                        chunks_since_ack = 0
+                        chunk_sent = True
+                        break
+
+                status_reply, status, status_err = await get_ota_status(max_attempts=2)
+                if status:
+                    if status[0] >= offset + len(chunk):
+                        # Command probably succeeded but its reply was lost.
+                        offset = status[0]
+                        chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
+                        chunks_since_ack = 0
+                        chunk_sent = True
+                        break
+                    if status[0] < offset:
+                        # Local offset got ahead; restart from repeater confirmed offset.
+                        offset = status[0]
+                        chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
+                        chunks_since_ack = 0
+                        chunk_sent = True
+                        if not json_output:
+                            print(f"Resync offset to {offset}/{fw_size}")
+                        break
+
+                if err:
+                    failure = err
+                else:
+                    failure = reply
+                if status_err is None and status_reply is not None:
+                    failure = f"{failure}; status={status_reply}"
+
+                if attempt < max_write_retries:
+                    if not json_output:
+                        print(f"Retry write at offset {offset} ({attempt}/{max_write_retries})")
+                    await asyncio.sleep(0.15 * attempt)
+                    continue
+
+            if not chunk_sent:
+                if json_output:
+                    print(json.dumps({"error": failure, "phase": "write", "offset": offset}))
+                else:
+                    print(f"OTA write failed at offset {offset}: {failure}")
+                return False
+            if OTA_ACK_SETTLE_GAP_SEC > 0:
+                await asyncio.sleep(OTA_ACK_SETTLE_GAP_SEC)
+
+        if not json_output:
+            pct = int((offset * 100) / fw_size)
+            if pct != last_print_pct and (pct % 2 == 0 or offset == fw_size):
+                print(f"Progress: {pct}% ({chunk_idx}/{total_chunks})")
+                last_print_pct = pct
+
+    reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, "ota end", timeout=25)
+    if err:
+        if json_output:
+            print(json.dumps({"error": err, "phase": "end"}))
+        else:
+            print(f"OTA end failed: {err}")
+        return False
+    if not reply.lower().startswith("ok"):
+        if json_output:
+            print(json.dumps({"error": reply, "phase": "end"}))
+        else:
+            print(f"OTA end failed: {reply}")
+        return False
+
+    # OTA is staged; reboot triggers boot-time patch/apply.
+    await send_cmd(mc, contact, "reboot")
+
+    if json_output:
+        print(json.dumps({
+            "result": "ok",
+            "target": contact["adv_name"],
+            "size": fw_size,
+            "md5": fw_md5,
+            "chunk_size": chunk_size,
+            "ack_every": ack_every,
+            "chunks": total_chunks,
+            "reboot_sent": True,
+        }))
+    else:
+        print("OTA staged successfully, reboot command sent.")
+
+    return True
 
 async def send_chan_msg(mc, nb, msg):
     res = await mc.commands.send_chan_msg(nb, msg)
@@ -2194,16 +2861,35 @@ async def next_cmd(mc, cmds, json_output=False):
                         else:
                             print("ok")
                     case "tuning":
-                        params=cmds[2].commands.split(",")
-                        res = await mc.commands.set_tuning(
-                            int(params[0]), int(params[1]))
-                        logger.debug(res)
-                        if res.type == EventType.ERROR:
-                            print(f"Error: {res}")
-                        elif json_output :
-                            print(json.dumps(res.payload, indent=4))
+                        params = cmds[2].split(",")
+                        if len(params) != 2:
+                            if json_output:
+                                print(json.dumps({"error": "tuning format must be rx_dly,af"}))
+                            else:
+                                print("Error: tuning format must be rx_dly,af")
                         else:
-                            print("ok")
+                            try:
+                                rx_dly = int(params[0])
+                                af = int(params[1])
+                            except ValueError:
+                                if json_output:
+                                    print(json.dumps({"error": "rx_dly and af must be integers"}))
+                                else:
+                                    print("Error: rx_dly and af must be integers")
+                            else:
+                                res = await mc.commands.set_tuning(rx_dly, af)
+                                logger.debug(res)
+                                if res.type == EventType.ERROR:
+                                    print(f"Error: {res}")
+                                elif json_output :
+                                    print(json.dumps(res.payload, indent=4))
+                                else:
+                                    print("ok")
+                    case "af":
+                        if json_output:
+                            print(json.dumps({"error": "use 'set tuning <rx_dly,af>' on companion radios"}))
+                        else:
+                            print("Use 'set tuning <rx_dly,af>' on companion radios.")
                     case "manual_add_contacts":
                         mac = (cmds[2] == "on") or (cmds[2] == "true") or (cmds[2] == "yes") or (cmds[2] == "1")
                         res = await mc.commands.set_manual_add_contacts(mac)
@@ -2426,6 +3112,11 @@ async def next_cmd(mc, cmds, json_output=False):
                                 print(f",{'on' if radio['repeat'] else 'off'}")
                             else:
                                 print("")
+                    case "af":
+                        if json_output:
+                            print(json.dumps({"error": "use 'set tuning <rx_dly,af>'; direct 'get af' is not supported"}))
+                        else:
+                            print("Use 'set tuning <rx_dly,af>'; direct 'get af' is not supported.")
                     case "repeat":
                         res = await mc.commands.send_device_query()
                         logger.debug(res)
@@ -2754,6 +3445,49 @@ async def next_cmd(mc, cmds, json_output=False):
                     elif json_output :
                         print(res.payload)
                         print(json.dumps(res.payload, indent=4))
+
+            case "ota":
+                argnum = 2
+                chunk_size = 64
+                ack_every = 1
+                if len(cmds) > 3:
+                    argnum = 3
+                    try:
+                        chunk_size = int(cmds[3])
+                    except ValueError:
+                        if json_output:
+                            print(json.dumps({"error": "chunk_size must be integer"}))
+                        else:
+                            print("chunk_size must be integer")
+                        return None
+                if len(cmds) > 4:
+                    argnum = 4
+                    try:
+                        ack_every = int(cmds[4])
+                    except ValueError:
+                        if json_output:
+                            print(json.dumps({"error": "ack_every must be integer"}))
+                        else:
+                            print("ack_every must be integer")
+                        return None
+
+                contact = await get_contact_from_arg(mc, cmds[1])
+                if contact is None:
+                    if json_output:
+                        print(json.dumps({"error": "unknown contact", "name": cmds[1]}))
+                    else:
+                        print(f"Unknown contact {cmds[1]}")
+                elif contact["type"] not in [2, 3]:
+                    if json_output:
+                        print(json.dumps({"error": "destination must be repeater or room", "name": contact["adv_name"]}))
+                    else:
+                        print(f"Destination {contact['adv_name']} is not a repeater/room")
+                else:
+                    await do_rp2040_ota_update(
+                        mc, contact, cmds[2],
+                        chunk_size=chunk_size, ack_every=ack_every,
+                        json_output=json_output
+                    )
 
             case "trace" | "tr":
                 argnum = 1
@@ -3625,7 +4359,7 @@ async def process_script(mc, file, json_output=False):
         if not (line == "" or line[0] == "#"):
             logger.debug(f"processing {line}")
             try :
-                cmds = shlex.split(line)
+                cmds = split_cli_args(line)
                 await process_cmds(mc, cmds, json_output)
             except ValueError:
                 logger.error(f"Error processing {line}")
@@ -3698,6 +4432,7 @@ def command_help():
     login <name> <pwd>     : log into a node (rep) with given pwd   l
     logout <name>          : log out of a repeater
     cmd <name> <cmd>       : sends a command to a repeater (no ack) c  [
+    ota <name> <bin> [sz] [ack_every] : RP2040 OTA update over mesh
     wmt8                   : wait for a msg (reply) with a timeout     ]
     req_status <name>      : requests status from a node            rs
     req_neighbours <name>  : requests for neighbours in binary form rn
@@ -3801,7 +4536,7 @@ def get_help_for (cmdname, context="line") :
   device:
     pin <pin>                   : ble pin
     radio <freq,bw,sf,cr>       : radio params
-    tuning <rx_dly,af>          : tuning params
+    tuning <rx_dly_ms,af_x1000> : tuning params for companion radios
     tx <dbm>                    : tx power
     name <name>                 : node name
     lat <lat>                   : latitude
@@ -3911,6 +4646,25 @@ There is a special case for auto channels, which starts with a #, these have alw
 To remove a channel, use remove_channel, either with channel name or number.
 """)
 
+    elif cmdname == "ota":
+        print("""ota <contact> <firmware.bin> [chunk_size] [ack_every]
+
+Uploads an RP2040 firmware binary to a repeater/room over mesh commands:
+  1) start ota
+  2) ota begin <size> <md5> <ack_every>
+  3) ota write <offset> <hex-chunk> (loop)
+  4) ota end
+  5) reboot
+
+Defaults:
+  chunk_size = 64 bytes (requested range 16..80)
+  ack_every = 1 chunk (1..64)
+  effective max depends on command text size (typically ~70), auto-clamped if needed.
+
+Example:
+  ota RP2040-LoRa .pio/build/waveshare_rp2040_lora_repeater/firmware.bin 64 10
+""")
+
     else:
         print(f"Sorry, no help yet for {cmdname}")
 
@@ -3966,6 +4720,8 @@ REPEATER_COMMANDS = {
     },
     "powersaving": {"on":None, "off":None,},
     "password": None,
+    "start ota": None,
+    "ota": {"status": None, "begin": None, "write": None, "end": None, "abort": None, "help": None},
     "erase": None,
     "gps": {"on": None, "off": None, "sync": None, "setloc": None, "advert": {"none": None, "share": None, "prefs": None}},
     "sensor": {"list": None, "get": None, "set": None},
@@ -4032,6 +4788,8 @@ REPEATER_HELP = f"""
 
 {ANSI_BGREEN}System:{ANSI_END}
   reboot              - Reboot device
+  start ota           - Arm RP2040 OTA session
+  ota status          - Show OTA progress
   erase               - Erase filesystem (serial only)
   script <file>       - Execute script
 
