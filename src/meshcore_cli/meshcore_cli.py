@@ -1768,6 +1768,100 @@ def format_ota_duration(seconds):
     return f"{minutes}m {rem:.1f}s"
 
 
+def _clamp(value, min_value, max_value):
+    return max(min_value, min(max_value, value))
+
+
+def estimate_ota_radio_profile(radio_bw_khz, radio_sf, radio_cr):
+    if radio_bw_khz is None or radio_sf is None or radio_cr is None:
+        return None
+    if radio_bw_khz <= 0:
+        return None
+
+    sf = int(_clamp(int(radio_sf), 5, 12))
+    bw = float(radio_bw_khz)
+    cr = int(_clamp(int(radio_cr), 5, 8))
+
+    # Relative airtime factor vs SF7/BW250/CR5 baseline.
+    sym_ratio = (2 ** (sf - 7)) * (250.0 / bw)
+    cr_factor = _clamp(cr / 5.0, 1.0, 1.8)
+    air_factor = _clamp(sym_ratio * cr_factor, 0.1, 20.0)
+
+    if air_factor <= 1.2:
+        chunk_binary = 132
+    elif air_factor <= 2.5:
+        chunk_binary = 120
+    elif air_factor <= 5.0:
+        chunk_binary = 104
+    elif air_factor <= 10.0:
+        chunk_binary = 88
+    else:
+        chunk_binary = 72
+
+    if air_factor <= 1.2:
+        chunk_text = 80
+    elif air_factor <= 2.5:
+        chunk_text = 72
+    elif air_factor <= 5.0:
+        chunk_text = 64
+    elif air_factor <= 10.0:
+        chunk_text = 56
+    else:
+        chunk_text = 48
+
+    if air_factor <= 0.25:
+        ack_every = 12
+    elif air_factor <= 0.6:
+        ack_every = 10
+    elif air_factor <= 1.2:
+        ack_every = 8
+    elif air_factor <= 2.5:
+        ack_every = 6
+    elif air_factor <= 5.0:
+        ack_every = 4
+    elif air_factor <= 10.0:
+        ack_every = 3
+    else:
+        ack_every = 2
+
+    noack_gap_sec = _clamp(0.015 + (0.025 * air_factor), 0.015, 0.45)
+    checkpoint_timeout_sec = _clamp(0.7 + (0.9 * air_factor), 1.2, 12.0)
+    status_timeout_sec = _clamp(0.5 + (0.8 * air_factor), 1.2, 10.0)
+
+    return {
+        "sf": sf,
+        "bw_khz": bw,
+        "cr": cr,
+        "air_factor": air_factor,
+        "chunk_binary": chunk_binary,
+        "chunk_text": chunk_text,
+        "ack_every": ack_every,
+        "noack_gap_sec": noack_gap_sec,
+        "checkpoint_timeout_sec": checkpoint_timeout_sec,
+        "status_timeout_sec": status_timeout_sec,
+    }
+
+
+async def get_ota_radio_profile(mc):
+    try:
+        await mc.commands.send_appstart()
+    except Exception:
+        pass
+
+    info = getattr(mc, "self_info", None)
+    if not isinstance(info, dict):
+        return None
+
+    try:
+        bw = float(info.get("radio_bw"))
+        sf = int(info.get("radio_sf"))
+        cr = int(info.get("radio_cr"))
+    except (TypeError, ValueError):
+        return None
+
+    return estimate_ota_radio_profile(bw, sf, cr)
+
+
 async def send_ota_binary_cmd(mc, contact, opcode, payload=b"", wait_reply=True, timeout=0, min_timeout=0.2):
     body = bytes([opcode]) + (payload if payload else b"")
     try:
@@ -1818,7 +1912,19 @@ async def send_ota_binary_cmd(mc, contact, opcode, payload=b"", wait_reply=True,
     return data.decode("utf-8", "ignore").rstrip("\x00"), None
 
 
-async def do_rp2040_ota_update_binary(mc, contact, firmware_path, chunk_size=96, ack_every=1, json_output=False):
+async def do_rp2040_ota_update_binary(mc, contact, firmware_path, chunk_size=None, ack_every=None, json_output=False):
+    radio_profile = await get_ota_radio_profile(mc)
+    if chunk_size is None:
+        if radio_profile:
+            chunk_size = radio_profile["chunk_binary"]
+        else:
+            chunk_size = 96
+    if ack_every is None:
+        if radio_profile:
+            ack_every = radio_profile["ack_every"]
+        else:
+            ack_every = 1
+
     if chunk_size < 16 or chunk_size > OTA_BINARY_MAX_CHUNK:
         if json_output:
             print(json.dumps({"error": f"chunk_size must be between 16 and {OTA_BINARY_MAX_CHUNK}"}))
@@ -1859,18 +1965,39 @@ async def do_rp2040_ota_update_binary(mc, contact, firmware_path, chunk_size=96,
     fw_md5_raw = bytes.fromhex(fw_md5)
     total_chunks = (fw_size + chunk_size - 1) // chunk_size
 
+    if radio_profile:
+        noack_gap_sec = radio_profile["noack_gap_sec"]
+        checkpoint_timeout_sec = radio_profile["checkpoint_timeout_sec"]
+        status_timeout_sec = radio_profile["status_timeout_sec"]
+        quick_status_timeout_sec = _clamp(status_timeout_sec * 0.55, 0.9, 2.0)
+    else:
+        noack_gap_sec = OTA_NOACK_WRITE_GAP_SEC
+        checkpoint_timeout_sec = OTA_CHECKPOINT_ACK_TIMEOUT_SEC
+        status_timeout_sec = 4.0
+        quick_status_timeout_sec = 1.2
+
     if not json_output:
         print(f"OTA target: {contact['adv_name']}")
         print(f"Firmware: {normalized_path} ({fw_size} bytes, md5={fw_md5})")
         print(f"Chunk size: {chunk_size} bytes ({total_chunks} chunks)")
         print(f"Ack every: {ack_every} chunk(s)")
         print("Transport: binary req")
+        print("Checkpoint mode: status")
+        if radio_profile:
+            print(
+                f"Radio profile: BW={radio_profile['bw_khz']:.1f}kHz SF={radio_profile['sf']} "
+                f"CR={radio_profile['cr']} factor={radio_profile['air_factor']:.2f}"
+            )
+        print(
+            f"Timing: gap={int(noack_gap_sec*1000)}ms "
+            f"checkpoint_timeout={checkpoint_timeout_sec:.2f}s"
+        )
 
-    async def get_ota_status(max_attempts=2):
+    async def get_ota_status(max_attempts=2, timeout_sec=4.0):
         last_err = None
         for attempt in range(max_attempts):
             status_reply, status_err = await send_ota_binary_cmd(
-                mc, contact, OTA_BIN_OP_STATUS, wait_reply=True, timeout=4, min_timeout=0.25
+                mc, contact, OTA_BIN_OP_STATUS, wait_reply=True, timeout=timeout_sec, min_timeout=0.25
             )
             if status_err is None:
                 return status_reply, parse_ota_status(status_reply), None
@@ -1965,128 +2092,105 @@ async def do_rp2040_ota_update_binary(mc, contact, firmware_path, chunk_size=96,
         is_last_chunk = (offset + chunk_len) >= fw_size
         checkpoint_due = (chunks_since_ack + 1 >= ack_every) or is_last_chunk
 
+        write_offset = offset
         write_payload = (
             offset.to_bytes(4, "little", signed=False)
             + chunk_len.to_bytes(1, "little", signed=False)
             + chunk
         )
 
-        if not checkpoint_due:
+        write_ok = False
+        failure = None
+
+        for attempt in range(1, max_write_retries + 1):
             chunk_write_attempts += 1
-            write_reply, write_err = await send_ota_binary_cmd(
+            _, write_err = await send_ota_binary_cmd(
                 mc, contact, OTA_BIN_OP_WRITE, payload=write_payload, wait_reply=False, timeout=0.25, min_timeout=0.1
             )
-            if write_err:
-                chunk_write_failures += 1
-                status_reply, status, status_err = await get_ota_status(max_attempts=2)
-                failure = write_err
-                if status and status[1] == fw_size and status[0] <= fw_size:
-                    offset = status[0]
+            if write_err is None:
+                write_ok = True
+                break
+
+            chunk_write_failures += 1
+            failure = write_err
+
+            # On send error, query status quickly and resync if possible.
+            status_reply, status, status_err = await get_ota_status(max_attempts=1, timeout_sec=quick_status_timeout_sec)
+            if status and status[1] == fw_size and status[0] <= fw_size:
+                srv_offset = status[0]
+                if srv_offset != offset:
+                    if not json_output:
+                        print(f"Resync offset to {srv_offset}/{fw_size}")
+                    offset = srv_offset
                     chunk_idx = offset // chunk_size
                     chunks_since_ack = 0
-                    if not json_output:
-                        print(f"Resync offset to {offset}/{fw_size}")
-                    continue
-                if status_err is None and status_reply is not None:
-                    failure = f"{failure}; status={status_reply}"
-                if json_output:
-                    print(json.dumps({"error": failure, "phase": "write", "offset": offset}))
-                else:
-                    print(f"OTA write failed at offset {offset}: {failure}")
-                return False
+                    write_ok = True
+                    break
 
+            if attempt < max_write_retries:
+                if not json_output:
+                    print(f"Retry write at offset {offset} ({attempt}/{max_write_retries})")
+                await asyncio.sleep(0.12 * attempt)
+                continue
+
+            if status_err is None and status_reply is not None:
+                failure = f"{failure}; status={status_reply}"
+
+        if not write_ok:
+            if json_output:
+                print(json.dumps({"error": failure, "phase": "write", "offset": offset}))
+            else:
+                print(f"OTA write failed at offset {offset}: {failure}")
+            return False
+
+        # If the send succeeded locally and no status-driven resync happened, advance local cursor.
+        if offset == write_offset:
             offset += chunk_len
             chunk_idx += 1
             chunks_since_ack += 1
-            if OTA_NOACK_WRITE_GAP_SEC > 0:
-                await asyncio.sleep(OTA_NOACK_WRITE_GAP_SEC)
+            if (not checkpoint_due) and noack_gap_sec > 0:
+                await asyncio.sleep(noack_gap_sec)
         else:
-            chunk_sent = False
-            failure = None
+            # status-driven resync consumed this turn
+            continue
+
+        if checkpoint_due:
+            checkpoint_ok = False
+            failure = "checkpoint status missing"
 
             for attempt in range(1, max_write_retries + 1):
-                chunk_write_attempts += 1
-                write_reply, write_err = await send_ota_binary_cmd(
-                    mc, contact, OTA_BIN_OP_WRITE, payload=write_payload, wait_reply=True,
-                    timeout=OTA_CHECKPOINT_ACK_TIMEOUT_SEC if ack_every > 1 else 5,
-                    min_timeout=0.1,
+                status_reply, status, status_err = await get_ota_status(
+                    max_attempts=1,
+                    timeout_sec=max(status_timeout_sec, checkpoint_timeout_sec),
                 )
-                if write_err is not None or not (write_reply == "" or write_reply.lower().startswith("ok")):
-                    chunk_write_failures += 1
 
-                if write_err is not None and ack_every > 1 and write_err.startswith("timeout waiting binary reply"):
-                    # Missing checkpoint ACK: continue optimistically.
-                    offset += chunk_len
-                    chunk_idx += 1
+                if status and status[1] == fw_size and status[0] <= fw_size:
+                    if status[0] != offset and not json_output:
+                        print(f"Resync offset to {status[0]}/{fw_size}")
+                    offset = status[0]
+                    chunk_idx = offset // chunk_size
                     chunks_since_ack = 0
-                    chunk_sent = True
+                    checkpoint_ok = True
                     break
 
-                if write_err is None and (write_reply == "" or write_reply.lower().startswith("ok")):
-                    offset += chunk_len
-                    chunk_idx += 1
-                    chunks_since_ack = 0
-                    chunk_sent = True
-                    break
-
-                off_err = parse_ota_offset_error(write_reply) if write_err is None else None
-                if off_err is not None:
-                    _, expected_offset = off_err
-                    if expected_offset >= offset + chunk_len:
-                        offset = expected_offset
-                        chunk_idx = offset // chunk_size
-                        chunks_since_ack = 0
-                        chunk_sent = True
-                        break
-                    if expected_offset < offset:
-                        offset = expected_offset
-                        chunk_idx = offset // chunk_size
-                        chunks_since_ack = 0
-                        chunk_sent = True
-                        if not json_output:
-                            print(f"Resync offset to {offset}/{fw_size}")
-                        break
-
-                if write_err:
-                    failure = write_err
-                elif write_reply:
-                    failure = write_reply
+                if status_err:
+                    failure = status_err
+                elif status_reply:
+                    failure = f"status={status_reply}"
                 else:
-                    failure = "checkpoint ack missing"
+                    failure = "invalid status response"
 
                 if attempt < max_write_retries:
                     if not json_output:
-                        print(f"Retry checkpoint at offset {offset} ({attempt}/{max_write_retries})")
+                        print(f"Retry checkpoint status at offset {offset} ({attempt}/{max_write_retries})")
                     await asyncio.sleep(0.12 * attempt)
-                    continue
 
-                status_reply, status, status_err = await get_ota_status(max_attempts=2)
-                if status and status[1] == fw_size and status[0] <= fw_size:
-                    if status[0] >= offset + chunk_len:
-                        offset = status[0]
-                        chunk_idx = offset // chunk_size
-                        chunks_since_ack = 0
-                        chunk_sent = True
-                        break
-                    if status[0] < offset:
-                        offset = status[0]
-                        chunk_idx = offset // chunk_size
-                        chunks_since_ack = 0
-                        chunk_sent = True
-                        if not json_output:
-                            print(f"Resync offset to {offset}/{fw_size}")
-                        break
-                if status_err is None and status_reply is not None:
-                    failure = f"{failure}; status={status_reply}"
-
-            if not chunk_sent:
+            if not checkpoint_ok:
                 if json_output:
-                    print(json.dumps({"error": failure, "phase": "write", "offset": offset}))
+                    print(json.dumps({"error": failure, "phase": "checkpoint", "offset": offset}))
                 else:
-                    print(f"OTA write failed at offset {offset}: {failure}")
+                    print(f"OTA checkpoint failed at offset {offset}: {failure}")
                 return False
-            if OTA_ACK_SETTLE_GAP_SEC > 0:
-                await asyncio.sleep(OTA_ACK_SETTLE_GAP_SEC)
 
         if not json_output:
             pct = int((offset * 100) / fw_size)
@@ -2249,7 +2353,19 @@ def estimate_ota_chunk_index(offset, preferred_chunk):
     return count
 
 
-async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_every=1, json_output=False):
+async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=None, ack_every=None, json_output=False):
+    radio_profile = await get_ota_radio_profile(mc)
+    if chunk_size is None:
+        if radio_profile:
+            chunk_size = radio_profile["chunk_text"]
+        else:
+            chunk_size = 64
+    if ack_every is None:
+        if radio_profile:
+            ack_every = radio_profile["ack_every"]
+        else:
+            ack_every = 1
+
     if chunk_size < 16 or chunk_size > 80:
         if json_output:
             print(json.dumps({"error": "chunk_size must be between 16 and 80"}))
@@ -2313,16 +2429,44 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_ev
             print(f"OTA aborted: {msg}")
         return False
 
+    if radio_profile:
+        noack_gap_sec = radio_profile["noack_gap_sec"]
+        checkpoint_timeout_sec = radio_profile["checkpoint_timeout_sec"]
+        status_timeout_sec = radio_profile["status_timeout_sec"]
+        ack_settle_gap_sec = _clamp(noack_gap_sec * 0.5, 0.01, 0.2)
+    else:
+        noack_gap_sec = OTA_NOACK_WRITE_GAP_SEC
+        checkpoint_timeout_sec = OTA_CHECKPOINT_ACK_TIMEOUT_SEC
+        status_timeout_sec = 4.0
+        ack_settle_gap_sec = OTA_ACK_SETTLE_GAP_SEC
+
+    start_timeout_sec = _clamp(max(8.0, status_timeout_sec * 2.2), 8.0, 25.0)
+    begin_timeout_sec = _clamp(max(10.0, status_timeout_sec * 2.8), 10.0, 30.0)
+    end_timeout_sec = _clamp(max(12.0, status_timeout_sec * 3.0), 12.0, 35.0)
+    write_ack_timeout_sec = _clamp(max(5.0, checkpoint_timeout_sec * 1.6), 5.0, 15.0)
+
     if not json_output:
         print(f"OTA target: {contact['adv_name']}")
         print(f"Firmware: {normalized_path} ({fw_size} bytes, md5={fw_md5})")
         print(f"Chunk size: {chunk_size} bytes ({total_chunks} chunks)")
         print(f"Ack every: {ack_every} chunk(s)")
+        if radio_profile:
+            print(
+                f"Radio profile: BW={radio_profile['bw_khz']:.1f}kHz SF={radio_profile['sf']} "
+                f"CR={radio_profile['cr']} factor={radio_profile['air_factor']:.2f}"
+            )
+        print(
+            f"Timing: gap={int(noack_gap_sec*1000)}ms "
+            f"checkpoint_timeout={checkpoint_timeout_sec:.2f}s "
+            f"status_timeout={status_timeout_sec:.2f}s"
+        )
 
     async def get_ota_status(max_attempts=2):
         last_err = None
         for attempt in range(max_attempts):
-            status_reply, status_err = await send_repeater_cmd_and_wait_reply(mc, contact, "ota status", timeout=10)
+            status_reply, status_err = await send_repeater_cmd_and_wait_reply(
+                mc, contact, "ota status", timeout=max(2.0, status_timeout_sec)
+            )
             if status_err is None:
                 return status_reply, parse_ota_status(status_reply), None
             last_err = status_err
@@ -2342,7 +2486,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_ev
     contact_prefix = contact["public_key"][:12].lower()
     purge_repeater_replies(contact_prefix)
 
-    reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, "start ota", timeout=15)
+    reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, "start ota", timeout=start_timeout_sec)
     if err:
         if json_output:
             print(json.dumps({"error": err, "phase": "start"}))
@@ -2380,7 +2524,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_ev
 
     if offset == 0:
         begin_cmd = f"ota begin {fw_size} {fw_md5} {ack_every}"
-        reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, begin_cmd, timeout=20)
+        reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, begin_cmd, timeout=begin_timeout_sec)
         if (err is None and not reply.lower().startswith("ok") and ack_every > 1 and
                 ("too many args" in reply.lower() or "bad ack" in reply.lower())):
             # Backward compatibility for repeaters that don't support begin ack_every.
@@ -2389,7 +2533,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_ev
             ack_every = 1
             chunks_since_ack = 0
             begin_cmd = f"ota begin {fw_size} {fw_md5}"
-            reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, begin_cmd, timeout=20)
+            reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, begin_cmd, timeout=begin_timeout_sec)
         if err:
             if json_output:
                 print(json.dumps({"error": err, "phase": "begin"}))
@@ -2446,7 +2590,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_ev
             for attempt in range(1, max_write_retries + 1):
                 chunk_write_attempts += 1
                 reply, err = await send_repeater_cmd_and_wait_reply(
-                    mc, contact, chunk_cmd, timeout=OTA_CHECKPOINT_ACK_TIMEOUT_SEC
+                    mc, contact, chunk_cmd, timeout=checkpoint_timeout_sec
                 )
                 if err is not None or not (reply == "" or reply.lower().startswith("ok")):
                     chunk_write_failures += 1
@@ -2526,8 +2670,8 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_ev
                 else:
                     print(f"OTA write failed at offset {offset}: {failure}")
                 return False
-            if OTA_ACK_SETTLE_GAP_SEC > 0:
-                await asyncio.sleep(OTA_ACK_SETTLE_GAP_SEC)
+            if ack_settle_gap_sec > 0:
+                await asyncio.sleep(ack_settle_gap_sec)
         elif not wait_for_ack:
             chunk_write_attempts += 1
             send_err = await send_repeater_cmd_no_wait(mc, contact, chunk_cmd)
@@ -2572,15 +2716,15 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_ev
                             else:
                                 print(f"Resync offset to {offset}/{fw_size}")
                         continue
-            elif OTA_NOACK_WRITE_GAP_SEC > 0:
-                await asyncio.sleep(OTA_NOACK_WRITE_GAP_SEC)
+            elif noack_gap_sec > 0:
+                await asyncio.sleep(noack_gap_sec)
         else:
             chunk_sent = False
             failure = None
 
             for attempt in range(1, max_write_retries + 1):
                 chunk_write_attempts += 1
-                reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, chunk_cmd, timeout=5)
+                reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, chunk_cmd, timeout=write_ack_timeout_sec)
                 if err is not None or not (reply == "" or reply.lower().startswith("ok")):
                     chunk_write_failures += 1
 
@@ -2631,8 +2775,8 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_ev
                 else:
                     print(f"OTA write failed at offset {offset}: {failure}")
                 return False
-            if OTA_ACK_SETTLE_GAP_SEC > 0:
-                await asyncio.sleep(OTA_ACK_SETTLE_GAP_SEC)
+            if ack_settle_gap_sec > 0:
+                await asyncio.sleep(ack_settle_gap_sec)
 
         if not json_output:
             pct = int((offset * 100) / fw_size)
@@ -2640,7 +2784,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=64, ack_ev
                 print(f"Progress: {pct}% ({chunk_idx}/{total_chunks})")
                 last_print_pct = pct
 
-    reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, "ota end", timeout=25)
+    reply, err = await send_repeater_cmd_and_wait_reply(mc, contact, "ota end", timeout=end_timeout_sec)
     if err:
         if json_output:
             print(json.dumps({"error": err, "phase": "end"}))
@@ -3872,8 +4016,8 @@ async def next_cmd(mc, cmds, json_output=False):
 
             case "ota":
                 argnum = 2
-                chunk_size = 64
-                ack_every = 1
+                chunk_size = None
+                ack_every = None
                 if len(cmds) > 3:
                     argnum = 3
                     try:
@@ -3913,10 +4057,10 @@ async def next_cmd(mc, cmds, json_output=False):
                         json_output=json_output,
                     )
                     if binary_result is None:
-                        fallback_chunk_size = chunk_size if chunk_size <= 80 else 80
+                        fallback_chunk_size = None if chunk_size is None else (chunk_size if chunk_size <= 80 else 80)
                         if not json_output:
                             print("Fallback OTA transport: text commands")
-                            if fallback_chunk_size != chunk_size:
+                            if chunk_size is not None and fallback_chunk_size != chunk_size:
                                 print(f"Fallback chunk size adjusted to {fallback_chunk_size} (text mode limit)")
                         await do_rp2040_ota_update(
                             mc, contact, cmds[2],
@@ -4867,7 +5011,7 @@ def command_help():
     login <name> <pwd>     : log into a node (rep) with given pwd   l
     logout <name>          : log out of a repeater
     cmd <name> <cmd>       : sends a command to a repeater (no ack) c  [
-    ota <name> <bin> [sz] [ack_every] : RP2040 OTA update over mesh
+    ota <name> <bin> [sz] [ack_every] : RP2040 OTA update over mesh (auto radio if omitted)
     wmt8                   : wait for a msg (reply) with a timeout     ]
     req_status <name>      : requests status from a node            rs
     req_neighbours <name>  : requests for neighbours in binary form rn
@@ -5091,8 +5235,10 @@ Transport order:
   2) fallback to legacy text ota commands if binary is unsupported.
 
 Defaults:
-  chunk_size = 64 bytes
-  ack_every = 1 chunk (1..64)
+  If omitted, chunk_size and ack_every are auto-tuned from current radio preset.
+  If radio preset is unavailable:
+    binary: chunk_size = 96 bytes, ack_every = 1
+    text  : chunk_size = 64 bytes, ack_every = 1
   binary max chunk = 132 bytes (frame-size limited)
   text fallback max is lower (command-size limited, typically ~70).
 
