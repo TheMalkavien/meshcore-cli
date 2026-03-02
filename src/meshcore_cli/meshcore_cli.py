@@ -1768,6 +1768,22 @@ def format_ota_duration(seconds):
     return f"{minutes}m {rem:.1f}s"
 
 
+def estimate_ota_rejected_chunks(local_offset, server_offset, chunk_size):
+    try:
+        local_val = int(local_offset)
+        server_val = int(server_offset)
+        step = int(chunk_size)
+    except (TypeError, ValueError):
+        return 0
+
+    if step <= 0:
+        step = 1
+    if server_val >= local_val:
+        return 0
+    diff = local_val - server_val
+    return max(1, (diff + step - 1) // step)
+
+
 def _clamp(value, min_value, max_value):
     return max(min_value, min(max_value, value))
 
@@ -1825,8 +1841,8 @@ def estimate_ota_radio_profile(radio_bw_khz, radio_sf, radio_cr):
         ack_every = 2
 
     noack_gap_sec = _clamp(0.015 + (0.025 * air_factor), 0.015, 0.45)
-    checkpoint_timeout_sec = _clamp(0.7 + (0.9 * air_factor), 1.2, 12.0)
-    status_timeout_sec = _clamp(0.5 + (0.8 * air_factor), 1.2, 10.0)
+    checkpoint_timeout_sec = _clamp(0.35 + (0.6 * air_factor), 0.5, 12.0)
+    status_timeout_sec = _clamp(0.35 + (0.8 * air_factor), 0.5, 10.0)
 
     return {
         "sf": sf,
@@ -1969,7 +1985,7 @@ async def do_rp2040_ota_update_binary(mc, contact, firmware_path, chunk_size=Non
         noack_gap_sec = radio_profile["noack_gap_sec"]
         checkpoint_timeout_sec = radio_profile["checkpoint_timeout_sec"]
         status_timeout_sec = radio_profile["status_timeout_sec"]
-        quick_status_timeout_sec = _clamp(status_timeout_sec * 0.55, 0.9, 2.0)
+        quick_status_timeout_sec = _clamp(status_timeout_sec * 0.55, 0.5, 2.0)
     else:
         noack_gap_sec = OTA_NOACK_WRITE_GAP_SEC
         checkpoint_timeout_sec = OTA_CHECKPOINT_ACK_TIMEOUT_SEC
@@ -2013,6 +2029,7 @@ async def do_rp2040_ota_update_binary(mc, contact, firmware_path, chunk_size=Non
     chunks_since_ack = 0
     chunk_write_attempts = 0
     chunk_write_failures = 0
+    chunk_server_rejects = 0
     ota_start_ts = time.monotonic()
 
     start_reply, start_err = await send_ota_binary_cmd(
@@ -2119,6 +2136,7 @@ async def do_rp2040_ota_update_binary(mc, contact, firmware_path, chunk_size=Non
             if status and status[1] == fw_size and status[0] <= fw_size:
                 srv_offset = status[0]
                 if srv_offset != offset:
+                    chunk_server_rejects += estimate_ota_rejected_chunks(offset, srv_offset, chunk_size)
                     if not json_output:
                         print(f"Resync offset to {srv_offset}/{fw_size}")
                     offset = srv_offset
@@ -2161,12 +2179,13 @@ async def do_rp2040_ota_update_binary(mc, contact, firmware_path, chunk_size=Non
             for attempt in range(1, max_write_retries + 1):
                 status_reply, status, status_err = await get_ota_status(
                     max_attempts=1,
-                    timeout_sec=max(status_timeout_sec, checkpoint_timeout_sec),
+                    timeout_sec=max(0.5, checkpoint_timeout_sec),
                 )
 
                 if status and status[1] == fw_size and status[0] <= fw_size:
                     if status[0] != offset and not json_output:
                         print(f"Resync offset to {status[0]}/{fw_size}")
+                    chunk_server_rejects += estimate_ota_rejected_chunks(offset, status[0], chunk_size)
                     offset = status[0]
                     chunk_idx = offset // chunk_size
                     chunks_since_ack = 0
@@ -2216,7 +2235,10 @@ async def do_rp2040_ota_update_binary(mc, contact, firmware_path, chunk_size=Non
 
     await send_cmd(mc, contact, "reboot")
     duration_sec = time.monotonic() - ota_start_ts
-    failure_rate_pct = (chunk_write_failures * 100.0 / chunk_write_attempts) if chunk_write_attempts > 0 else 0.0
+    send_failure_rate_pct = (chunk_write_failures * 100.0 / chunk_write_attempts) if chunk_write_attempts > 0 else 0.0
+    server_reject_rate_pct = (chunk_server_rejects * 100.0 / chunk_write_attempts) if chunk_write_attempts > 0 else 0.0
+    total_rejects = chunk_write_failures + chunk_server_rejects
+    failure_rate_pct = (total_rejects * 100.0 / chunk_write_attempts) if chunk_write_attempts > 0 else 0.0
 
     if json_output:
         print(json.dumps({
@@ -2232,14 +2254,19 @@ async def do_rp2040_ota_update_binary(mc, contact, firmware_path, chunk_size=Non
             "duration_sec": round(duration_sec, 3),
             "chunk_write_attempts": chunk_write_attempts,
             "chunk_write_failures": chunk_write_failures,
+            "chunk_server_rejects": chunk_server_rejects,
+            "total_rejects": total_rejects,
+            "send_failure_rate_pct": round(send_failure_rate_pct, 3),
+            "server_reject_rate_pct": round(server_reject_rate_pct, 3),
             "chunk_failure_rate_pct": round(failure_rate_pct, 3),
         }))
     else:
         print("OTA staged successfully, reboot command sent.")
         print(f"Duration: {format_ota_duration(duration_sec)}")
         print(
-            f"Chunk failures: {chunk_write_failures}/{chunk_write_attempts} "
-            f"({failure_rate_pct:.2f}%)"
+            f"Chunk rejects: total {total_rejects}/{chunk_write_attempts} ({failure_rate_pct:.2f}%), "
+            f"send {chunk_write_failures}/{chunk_write_attempts} ({send_failure_rate_pct:.2f}%), "
+            f"server {chunk_server_rejects}/{chunk_write_attempts} ({server_reject_rate_pct:.2f}%)"
         )
 
     return True
@@ -2482,6 +2509,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=None, ack_
     chunks_since_ack = 0
     chunk_write_attempts = 0
     chunk_write_failures = 0
+    chunk_server_rejects = 0
     ota_start_ts = time.monotonic()
     contact_prefix = contact["public_key"][:12].lower()
     purge_repeater_replies(contact_prefix)
@@ -2557,6 +2585,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=None, ack_
                     expected_offset = status[0]
                 if expected_offset != offset:
                     chunk_write_failures += 1
+                    chunk_server_rejects += estimate_ota_rejected_chunks(offset, expected_offset, chunk_size)
                     offset = expected_offset
                     chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
                     chunks_since_ack = 0
@@ -2613,6 +2642,8 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=None, ack_
                 offset_err = parse_ota_offset_error(reply) if err is None else None
                 if offset_err is not None:
                     _, expected_offset = offset_err
+                    if expected_offset < offset + len(chunk):
+                        chunk_server_rejects += estimate_ota_rejected_chunks(offset + len(chunk), expected_offset, chunk_size)
                     if expected_offset >= offset + len(chunk):
                         # Checkpoint write likely succeeded, but we got a duplicate/late retry response.
                         offset = expected_offset
@@ -2654,6 +2685,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=None, ack_
                         break
                     if status[0] < offset:
                         # Local offset got ahead; restart from repeater confirmed offset.
+                        chunk_server_rejects += estimate_ota_rejected_chunks(offset, status[0], chunk_size)
                         offset = status[0]
                         chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
                         chunks_since_ack = 0
@@ -2679,6 +2711,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=None, ack_
                 chunk_write_failures += 1
                 status_reply, status, status_err = await get_ota_status(max_attempts=2)
                 if status and status[0] != offset:
+                    chunk_server_rejects += estimate_ota_rejected_chunks(offset, status[0], chunk_size)
                     offset = status[0]
                     chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
                     chunks_since_ack = 0
@@ -2707,6 +2740,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=None, ack_
                     if status and status[1] == fw_size and status[0] <= fw_size:
                         expected_offset = status[0]
                     if expected_offset != offset:
+                        chunk_server_rejects += estimate_ota_rejected_chunks(offset, expected_offset, chunk_size)
                         offset = expected_offset
                         chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
                         chunks_since_ack = 0
@@ -2748,6 +2782,7 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=None, ack_
                         break
                     if status[0] < offset:
                         # Local offset got ahead; restart from repeater confirmed offset.
+                        chunk_server_rejects += estimate_ota_rejected_chunks(offset, status[0], chunk_size)
                         offset = status[0]
                         chunk_idx = estimate_ota_chunk_index(offset, chunk_size)
                         chunks_since_ack = 0
@@ -2801,7 +2836,10 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=None, ack_
     # OTA is staged; reboot triggers boot-time patch/apply.
     await send_cmd(mc, contact, "reboot")
     duration_sec = time.monotonic() - ota_start_ts
-    failure_rate_pct = (chunk_write_failures * 100.0 / chunk_write_attempts) if chunk_write_attempts > 0 else 0.0
+    send_failure_rate_pct = (chunk_write_failures * 100.0 / chunk_write_attempts) if chunk_write_attempts > 0 else 0.0
+    server_reject_rate_pct = (chunk_server_rejects * 100.0 / chunk_write_attempts) if chunk_write_attempts > 0 else 0.0
+    total_rejects = chunk_write_failures + chunk_server_rejects
+    failure_rate_pct = (total_rejects * 100.0 / chunk_write_attempts) if chunk_write_attempts > 0 else 0.0
 
     if json_output:
         print(json.dumps({
@@ -2816,14 +2854,19 @@ async def do_rp2040_ota_update(mc, contact, firmware_path, chunk_size=None, ack_
             "duration_sec": round(duration_sec, 3),
             "chunk_write_attempts": chunk_write_attempts,
             "chunk_write_failures": chunk_write_failures,
+            "chunk_server_rejects": chunk_server_rejects,
+            "total_rejects": total_rejects,
+            "send_failure_rate_pct": round(send_failure_rate_pct, 3),
+            "server_reject_rate_pct": round(server_reject_rate_pct, 3),
             "chunk_failure_rate_pct": round(failure_rate_pct, 3),
         }))
     else:
         print("OTA staged successfully, reboot command sent.")
         print(f"Duration: {format_ota_duration(duration_sec)}")
         print(
-            f"Chunk failures: {chunk_write_failures}/{chunk_write_attempts} "
-            f"({failure_rate_pct:.2f}%)"
+            f"Chunk rejects: total {total_rejects}/{chunk_write_attempts} ({failure_rate_pct:.2f}%), "
+            f"send {chunk_write_failures}/{chunk_write_attempts} ({send_failure_rate_pct:.2f}%), "
+            f"server {chunk_server_rejects}/{chunk_write_attempts} ({server_reject_rate_pct:.2f}%)"
         )
 
     return True
